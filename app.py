@@ -1,6 +1,5 @@
 import os
 import uuid
-import json
 import requests
 from flask import Flask, request, redirect, jsonify
 
@@ -8,8 +7,12 @@ app = Flask(__name__)
 
 SQUARE_ACCESS_TOKEN = os.environ["SQUARE_ACCESS_TOKEN"]
 SQUARE_LOCATION_ID = os.environ["SQUARE_LOCATION_ID"]
-SQUARE_VERSION = os.environ.get("SQUARE_VERSION", "2026-08-19")
-SQUARE_BASE_URL = os.environ.get("SQUARE_BASE_URL", "https://connect.squareup.com")
+
+SQUARE_VERSION = os.environ.get(
+    "SQUARE_VERSION",
+    "2026-08-19"
+)
+
 SQUARE_BASE_URL = os.environ.get(
     "SQUARE_BASE_URL",
     "https://connect.squareup.com"
@@ -17,209 +20,308 @@ SQUARE_BASE_URL = os.environ.get(
 
 HEADERS = {
     "Authorization": f"Bearer {SQUARE_ACCESS_TOKEN}",
-@@ -20,34 +23,74 @@
-with open("product_map.json", "r", encoding="utf-8") as f:
-    PRODUCTS = json.load(f)
-
-PRODUCTS_BY_SKU = {str(p["sku"]).strip().upper(): p for p in PRODUCTS if p.get("sku")}
-# Meta is sending the "token" from the Square catalog export as its Content ID.
-# We also keep SKU support in case Meta sends a SKU for any product.
-PRODUCTS_BY_TOKEN = {
-    str(p["token"]).strip().upper(): p
-    for p in PRODUCTS
-    if p.get("token")
+    "Content-Type": "application/json",
+    "Square-Version": SQUARE_VERSION,
 }
-
-PRODUCTS_BY_SKU = {
-    str(p["sku"]).strip().upper(): p
-    for p in PRODUCTS
-    if p.get("sku")
-}
-
-
-def resolve_product(identifier):
-    key = identifier.strip().upper()
-
-    if key in PRODUCTS_BY_TOKEN:
-        return PRODUCTS_BY_TOKEN[key]
-
-    if key in PRODUCTS_BY_SKU:
-        return PRODUCTS_BY_SKU[key]
-
-    raise LookupError(
-    f"Product ID not found in Square catalog: {identifier}"
-)
-    )
 
 
 def parse_products(raw):
+    """
+    Instagram sends products like:
+
+    PRODUCT_ID:1,PRODUCT_ID:2
+
+    Returns a list of:
+    (product_id, quantity)
+    """
+
     if not raw:
         raise ValueError("Missing products parameter.")
 
-    parsed = []
+    products = []
 
-    for entry in raw.split(","):
-        entry = entry.strip()
+    for part in raw.split(","):
+        part = part.strip()
 
-        if not entry:
+        if not part:
             continue
 
-        parts = entry.rsplit(":", 1)
+        pieces = part.rsplit(":", 1)
 
-        if len(parts) != 2:
-            raise ValueError(f"Invalid product entry: {entry}")
+        if len(pieces) != 2:
+            raise ValueError(
+                f"Invalid product entry: {part}"
+            )
 
-        sku = parts[0].strip()
-        identifier = parts[0].strip()
+        product_id = pieces[0].strip()
 
         try:
-            qty = int(parts[1])
+            quantity = int(pieces[1])
         except ValueError:
-            raise ValueError(f"Invalid quantity for SKU {sku}")
             raise ValueError(
-                f"Invalid quantity for product {identifier}"
+                f"Invalid quantity for product: {product_id}"
             )
 
-        if qty < 1:
-            raise ValueError(f"Quantity must be at least 1 for SKU {sku}")
+        if not product_id:
             raise ValueError(
-                f"Quantity must be at least 1 for product {identifier}"
+                "Product ID cannot be empty."
             )
 
-        if sku.upper() not in PRODUCTS_BY_SKU:
-            raise LookupError(f"SKU not found in exported Square catalog: {sku}")
-        product = resolve_product(identifier)
-
-        sku = str(product.get("sku", "")).strip()
-
-        if not sku:
-            raise LookupError(
-                f"Square SKU missing for product: {identifier}"
+        if quantity < 1:
+            raise ValueError(
+                f"Quantity must be at least 1 for {product_id}"
             )
 
-        parsed.append((sku, qty))
+        products.append(
+            (product_id, quantity)
+        )
 
-@@ -69,24 +112,36 @@
-        "limit": 10
-    }
+    if not products:
+        raise ValueError(
+            "No valid products supplied."
+        )
 
-    r = requests.post(
-    response = requests.post(
-        f"{SQUARE_BASE_URL}/v2/catalog/search",
+    return products
+
+
+def get_square_catalog_object(object_id):
+    """
+    Ask Square directly for the catalog object.
+    """
+
+    response = requests.get(
+        f"{SQUARE_BASE_URL}/v2/catalog/object/{object_id}",
         headers=HEADERS,
-        json=payload,
         timeout=20
     )
-    r.raise_for_status()
+
+    if response.status_code == 404:
+        return None
 
     response.raise_for_status()
 
-    matches = []
-    for obj in r.json().get("objects", []):
+    return response.json().get("object")
 
-    for obj in response.json().get("objects", []):
-        variation_data = obj.get("item_variation_data", {})
-        if str(variation_data.get("sku", "")).strip().upper() == sku.upper():
 
-        found_sku = str(
-            variation_data.get("sku", "")
-        ).strip().upper()
+def find_variation_for_item(item):
+    """
+    Find a usable variation belonging to a Square item.
+    """
 
-        if found_sku == sku.upper():
-            matches.append(obj)
+    item_data = item.get("item_data", {})
 
-    if not matches:
-        raise LookupError(f"Square could not find SKU: {sku}")
-        raise LookupError(
-            f"Square could not find SKU: {sku}"
+    variations = item_data.get(
+        "variations",
+        []
+    )
+
+    usable = []
+
+    for variation in variations:
+        if variation.get("is_deleted"):
+            continue
+
+        if variation.get("type") != "ITEM_VARIATION":
+            continue
+
+        variation_data = variation.get(
+            "item_variation_data",
+            {}
         )
 
-    if len(matches) > 1:
-        raise LookupError(f"More than one Square variation uses SKU: {sku}")
+        if variation_data.get("sellable") is False:
+            continue
+
+        if variation_data.get("location_overrides"):
+            usable.append(variation)
+        else:
+            usable.append(variation)
+
+    if len(usable) == 1:
+        return usable[0]
+
+    if len(usable) > 1:
+        # If there are multiple variations, prefer
+        # the first sellable variation with a price.
+        priced = []
+
+        for variation in usable:
+            variation_data = variation.get(
+                "item_variation_data",
+                {}
+            )
+
+            price_money = variation_data.get(
+                "price_money"
+            )
+
+            if price_money:
+                priced.append(variation)
+
+        if len(priced) == 1:
+            return priced[0]
+
         raise LookupError(
-            f"More than one Square variation uses SKU: {sku}"
+            "Square item has multiple variations. "
+            "Instagram sent the item ID instead of "
+            "a specific variation ID."
         )
 
-    return matches[0]
+    raise LookupError(
+        "Square item has no usable variation."
+    )
 
-@@ -96,6 +151,7 @@
 
-    for sku, qty in products:
-        variation = find_square_variation_by_sku(sku)
+def resolve_catalog_variation(product_id):
+    """
+    Convert the ID Instagram sends into the
+    Square catalog variation ID needed for checkout.
+    """
+
+    obj = get_square_catalog_object(product_id)
+
+    if not obj:
+        return None
+
+    object_type = obj.get("type")
+
+    # Instagram sent a Square variation ID.
+    if object_type == "ITEM_VARIATION":
+        return obj
+
+    # Instagram sent a Square item ID.
+    if object_type == "ITEM":
+        return find_variation_for_item(obj)
+
+    return None
+
+
+def create_square_checkout(products):
+    """
+    Build a Square payment link from Instagram's cart.
+    """
+
+    line_items = []
+
+    for product_id, quantity in products:
+
+        variation = resolve_catalog_variation(
+            product_id
+        )
+
+        if not variation:
+            raise LookupError(
+                f"Instagram product ID "
+                f"{product_id} could not be matched "
+                f"to a Square catalog item."
+            )
 
         line_items.append({
-            "quantity": str(qty),
+            "quantity": str(quantity),
             "catalog_object_id": variation["id"]
-@@ -109,42 +165,63 @@
+        })
+
+    body = {
+        "idempotency_key": str(uuid.uuid4()),
+        "order": {
+            "location_id": SQUARE_LOCATION_ID,
+            "line_items": line_items
         }
     }
 
-    r = requests.post(
     response = requests.post(
         f"{SQUARE_BASE_URL}/v2/online-checkout/payment-links",
         headers=HEADERS,
         json=body,
         timeout=20
     )
-    r.raise_for_status()
 
-    return r.json()["payment_link"]["long_url"]
     response.raise_for_status()
 
-    return response.json()["payment_link"]["long_url"]
+    data = response.json()
+
+    payment_link = data.get(
+        "payment_link",
+        {}
+    )
+
+    checkout_url = payment_link.get(
+        "long_url"
+    )
+
+    if not checkout_url:
+        raise LookupError(
+            "Square did not return a checkout URL."
+        )
+
+    return checkout_url
 
 
 @app.get("/")
 def home():
-    return f"Meta → Square checkout bridge is running. Catalog contains {len(PRODUCTS_BY_SKU)} SKUs.", 200
     return (
-        "Meta → Square checkout bridge is running. "
-        f"Catalog contains {len(PRODUCTS_BY_TOKEN)} product IDs "
-        f"and {len(PRODUCTS_BY_SKU)} SKUs."
+        "The SCENT & Market Co. "
+        "Meta → Square checkout bridge is running."
     ), 200
 
 
 @app.get("/checkout")
 def checkout():
+
     try:
-        products = parse_products(request.args.get("products", ""))
-        products = parse_products(
-            request.args.get("products", "")
+
+        raw_products = request.args.get(
+            "products",
+            ""
         )
 
-        checkout_url = create_checkout(products)
+        products = parse_products(
+            raw_products
+        )
 
-        return redirect(checkout_url, code=302)
+        checkout_url = create_square_checkout(
+            products
+        )
 
-    except requests.HTTPError as e:
+        return redirect(
+            checkout_url,
+            code=302
+        )
+
+    except requests.HTTPError as error:
+
         try:
-            detail = e.response.json()
+            detail = error.response.json()
         except Exception:
-            detail = str(e)
-        return jsonify({"error": "Square API error", "detail": detail}), 502
+            detail = str(error)
 
         return jsonify({
             "error": "Square API error",
             "detail": detail
         }), 502
 
-    except (ValueError, LookupError) as e:
-        return jsonify({"error": str(e)}), 400
+    except (ValueError, LookupError) as error:
+
         return jsonify({
-            "error": str(e)
+            "error": str(error)
         }), 400
 
-    except Exception as e:
-        return jsonify({"error": "Unexpected error", "detail": str(e)}), 500
+    except Exception as error:
+
         return jsonify({
             "error": "Unexpected error",
-            "detail": str(e)
+            "detail": str(error)
         }), 500
 
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", "8080")))
+
     app.run(
         host="0.0.0.0",
-        port=int(os.environ.get("PORT", "8080"))
+        port=int(
+            os.environ.get(
+                "PORT",
+                "8080"
+            )
+        )
     )
