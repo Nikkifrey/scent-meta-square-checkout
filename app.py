@@ -47,7 +47,8 @@ def resolve_product(identifier):
         return PRODUCTS_BY_SKU[key]
 
     raise LookupError(
-        f"Product ID not found in exported Square catalog: {identifier}"
+    f"Product ID not found in Square catalog: {identifier}"
+)
     )
 
 
